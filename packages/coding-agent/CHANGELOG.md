@@ -193,6 +193,13 @@
 
 - Enabled inline prompts with `/loop` commands (e.g., `/loop 10 fix the bug`)
 - Added support for compound duration formats in `/loop` (e.g., `1h30m`)
+### Added
+
+- Added a `goal` status-line segment for custom presets. It renders the active goal objective in `statusLine.leftSegments` / `statusLine.rightSegments` and supports `statusLine.segmentOptions.goal.maxLength` in `~/.omp/agent/config.yml`.
+
+### Fixed
+
+- Kept completed goals visible in status-line goal segments until goal-mode cleanup clears the session state.
 
 ## [16.1.5] - 2026-06-19
 
