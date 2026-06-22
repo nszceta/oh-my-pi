@@ -16,8 +16,8 @@ interface Options {
 	noInstall: boolean;
 	noPush: boolean;
 	noSmokeTest: boolean;
-	pushBranch: string | null;
 	pushRemote: string;
+	targetBranch: string | null;
 }
 
 interface RunOptions {
@@ -42,18 +42,19 @@ const protectedBranches: Record<string, true> = { main: true, master: true, deve
 
 const usage = `Usage: bun run update:feature-branch [options]
 
-Fetch upstream, rebase the current feature branch onto upstream/main, force-push
-the rebased branch to origin with a lease, rebuild omp, smoke-test the build,
-and replace the currently installed omp binary.
+Fetch upstream, rebase the target feature branch onto upstream/main, force-push
+it to origin with a lease, then rebase this helper branch onto the updated
+feature branch so the helper stays feature + script commit(s). Finally, rebuild
+omp, smoke-test the build, and replace the currently installed omp binary.
 
 Options:
   --fetch-remote <name>        Remote to fetch/rebase from (default: upstream)
   --push-remote <name>         Remote to force-push to (default: origin)
   --remote <name>              Use one remote for both fetch and push
   --base <ref>                 Rebase base (default: <fetch-remote>/main)
-  --branch <name>              Remote branch to update (default: current branch)
+  --branch <name>              Feature branch to update (default: helper without -update-script suffix)
   --binary <path>              omp binary to replace (default: PATH lookup)
-  --allow-dirty                Rebase with git --autostash instead of requiring a clean worktree
+  --allow-dirty                Stash local helper changes before updating branches
   --allow-protected-branch     Allow updating main/master/develop/trunk
   --no-push                    Rebase/build locally without pushing
   --no-install                 Skip bun install --frozen-lockfile after rebase
@@ -82,8 +83,8 @@ function parseArgs(args: string[]): Options {
 		noInstall: false,
 		noPush: false,
 		noSmokeTest: false,
-		pushBranch: null,
 		pushRemote: "origin",
+		targetBranch: null,
 	};
 
 	for (let index = 0; index < args.length; index += 1) {
@@ -129,12 +130,12 @@ function parseArgs(args: string[]): Options {
 			continue;
 		}
 		if (arg === "--branch") {
-			options.pushBranch = readFlagValue(args, index, arg);
+			options.targetBranch = readFlagValue(args, index, arg);
 			index += 1;
 			continue;
 		}
 		if (arg.startsWith("--branch=")) {
-			options.pushBranch = arg.slice("--branch=".length);
+			options.targetBranch = arg.slice("--branch=".length);
 			continue;
 		}
 		if (arg === "--binary") {
@@ -177,7 +178,7 @@ function parseArgs(args: string[]): Options {
 	if (!options.fetchRemote) throw new Error("--fetch-remote cannot be empty");
 	if (!options.pushRemote) throw new Error("--push-remote cannot be empty");
 	if (options.base === "") throw new Error("--base cannot be empty");
-	if (options.pushBranch === "") throw new Error("--branch cannot be empty");
+	if (options.targetBranch === "") throw new Error("--branch cannot be empty");
 	if (options.binary === "") throw new Error("--binary cannot be empty");
 
 	return options;
@@ -241,12 +242,27 @@ async function currentBranch(): Promise<string> {
 	return branch;
 }
 
-async function assertCleanWorktree(allowDirty: boolean): Promise<void> {
-	if (allowDirty) return;
+function inferTargetBranch(helperBranch: string, explicitBranch: string | null): string {
+	if (explicitBranch) return explicitBranch;
+
+	const helperSuffix = "-update-script";
+	if (helperBranch.endsWith(helperSuffix)) {
+		return helperBranch.slice(0, -helperSuffix.length);
+	}
+	return helperBranch;
+}
+
+async function prepareDirtyWorktree(allowDirty: boolean, dryRun: boolean): Promise<boolean> {
 	const status = await captureText(["git", "status", "--porcelain=v1"]);
-	if (status) {
+	if (!status) return false;
+	if (!allowDirty) {
 		throw new Error("Working tree has uncommitted changes; commit/stash them or pass --allow-dirty.");
 	}
+
+	await runCommand(["git", "stash", "push", "--include-untracked", "--message", "omp update-feature-branch autostash"], {
+		dryRun,
+	});
+	return true;
 }
 
 async function assertRefExists(ref: string, dryRun: boolean): Promise<void> {
@@ -360,25 +376,57 @@ async function main(): Promise<void> {
 		return;
 	}
 
-	const localBranch = await currentBranch();
-	const pushBranch = options.pushBranch ?? localBranch;
-	if (!options.allowProtectedBranch && protectedBranches[pushBranch]) {
-		throw new Error(`Refusing to force-push protected branch '${pushBranch}'.`);
+	const helperBranch = await currentBranch();
+	const targetBranch = inferTargetBranch(helperBranch, options.targetBranch);
+	if (!options.allowProtectedBranch && protectedBranches[targetBranch]) {
+		throw new Error(`Refusing to force-push protected branch '${targetBranch}'.`);
 	}
-	await assertCleanWorktree(options.allowDirty);
+	if (!options.allowProtectedBranch && protectedBranches[helperBranch]) {
+		throw new Error(`Refusing to force-push protected branch '${helperBranch}'.`);
+	}
+	const stashedWorktree = await prepareDirtyWorktree(options.allowDirty, options.dryRun);
 	const binaryPath = resolveBinaryPath(options.binary, options.dryRun);
 	await assertReplaceTargetIsSafe(binaryPath, options.dryRun);
 
-	section("Git sync");
+	section("Fetch remotes");
 	await runCommand(["git", "fetch", options.fetchRemote, "--prune"], { dryRun: options.dryRun });
+	if (options.pushRemote !== options.fetchRemote) {
+		await runCommand(["git", "fetch", options.pushRemote, "--prune"], { dryRun: options.dryRun });
+	}
 	const base = options.base ?? `${options.fetchRemote}/main`;
 	await assertRefExists(base, options.dryRun);
+	await assertRefExists(`refs/heads/${targetBranch}`, options.dryRun);
+	const oldTargetTip = options.dryRun
+		? "OLD_TARGET_TIP"
+		: await captureText(["git", "rev-parse", `refs/heads/${targetBranch}^{commit}`]);
+
+	section("Update feature branch");
+	if (helperBranch !== targetBranch) {
+		await runCommand(["git", "switch", targetBranch], { dryRun: options.dryRun });
+	}
 	await runCommand(["git", "rebase", ...(options.allowDirty ? ["--autostash"] : []), base], { dryRun: options.dryRun });
 	if (!options.noPush) {
 		await runCommand(
-			["git", "push", "--force-with-lease", "--set-upstream", options.pushRemote, `HEAD:refs/heads/${pushBranch}`],
+			["git", "push", "--force-with-lease", "--set-upstream", options.pushRemote, `HEAD:refs/heads/${targetBranch}`],
 			{ dryRun: options.dryRun },
 		);
+	}
+
+	if (helperBranch !== targetBranch) {
+		section("Update helper branch");
+		await runCommand(["git", "switch", helperBranch], { dryRun: options.dryRun });
+		await runCommand(["git", "rebase", "--onto", targetBranch, oldTargetTip], { dryRun: options.dryRun });
+		if (!options.noPush) {
+			await runCommand(
+				["git", "push", "--force-with-lease", "--set-upstream", options.pushRemote, `HEAD:refs/heads/${helperBranch}`],
+				{ dryRun: options.dryRun },
+			);
+		}
+	}
+
+	if (stashedWorktree) {
+		section("Restore local changes");
+		await runCommand(["git", "stash", "pop"], { dryRun: options.dryRun });
 	}
 
 	section("Build omp");
@@ -394,8 +442,11 @@ async function main(): Promise<void> {
 	await smokeInstalledBinary(binaryPath, options);
 
 	console.log(
-		`\nUpdated ${localBranch}: rebased onto ${base}${options.noPush ? "" : ` and force-pushed to ${options.pushRemote}/${pushBranch}`}.`,
+		`\nUpdated ${targetBranch}: rebased onto ${base}${options.noPush ? "" : ` and force-pushed to ${options.pushRemote}/${targetBranch}`}.`,
 	);
+	if (helperBranch !== targetBranch) {
+		console.log(`Updated ${helperBranch}: rebased helper commit(s) onto ${targetBranch}.`);
+	}
 	console.log(`Replaced omp binary at ${binaryPath}.`);
 }
 
